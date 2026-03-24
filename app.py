@@ -10,8 +10,6 @@ import os
 import sys
 import tempfile
 
-import cv2
-import numpy as np
 import streamlit as st
 from PIL import Image
 
@@ -189,6 +187,34 @@ def _reset_pipeline(fps, clip_dur):
     st.session_state.query_result = None
 
 
+def _compute_playback_window(
+    clip_start: float,
+    clip_end: float,
+    video_duration: float | None,
+    pre_sec: float = 6.0,
+    post_sec: float = 8.0,
+    min_window_sec: float = 8.0,
+) -> tuple[float, float]:
+    """
+    Expand a retrieved clip into a wider incident window for easier validation.
+    """
+    start = max(0.0, float(clip_start) - pre_sec)
+    end = max(start + 0.5, float(clip_end) + post_sec)
+
+    # Ensure a minimum context window (avoid tiny 1-second playback)
+    if end - start < min_window_sec:
+        pad = (min_window_sec - (end - start)) / 2.0
+        start = max(0.0, start - pad)
+        end = end + pad
+
+    if video_duration is not None:
+        end = min(float(video_duration), end)
+        if end - start < min_window_sec:
+            start = max(0.0, end - min_window_sec)
+
+    return start, end
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Fixed Parameters
 # ══════════════════════════════════════════════════════════════════════════════
@@ -323,6 +349,10 @@ with tab_query:
             q_text = st.session_state.get("last_question", "")
             clips = result["clips"]
             explanation = result["explanation"]
+            source_video = pipeline.video_path if pipeline else None
+            video_duration = None
+            if st.session_state.get("ingest_summary"):
+                video_duration = st.session_state.ingest_summary.get("duration_sec")
 
             st.markdown(f"---\n### 🎯 Results for: *\"{q_text}\"*")
             st.markdown(f"Found **{len(clips)} relevant clips**")
@@ -333,15 +363,26 @@ with tab_query:
                 ts_end = format_timestamp(clip["end_sec"])
                 score_pct = min(clip.get("score", 0) * 100, 100)
                 rep_frame = clip.get("representative_frame", "")
+                play_start, play_end = _compute_playback_window(
+                    clip.get("start_sec", 0.0),
+                    clip.get("end_sec", 0.0),
+                    video_duration,
+                )
 
                 col_img, col_info = st.columns([1, 2])
 
                 with col_img:
-                    if rep_frame and os.path.exists(rep_frame):
+                    if source_video and os.path.exists(source_video):
+                        try:
+                            st.video(source_video, start_time=play_start, end_time=play_end)
+                        except TypeError:
+                            # Older Streamlit versions may not support end_time
+                            st.video(source_video, start_time=play_start)
+                    elif rep_frame and os.path.exists(rep_frame):
                         img = Image.open(rep_frame).convert("RGB")
                         st.image(img, use_container_width=True)
                     else:
-                        st.markdown("*Frame not available*")
+                        st.markdown("*Playback/frame not available*")
 
                 with col_info:
                     st.markdown(
@@ -351,6 +392,9 @@ with tab_query:
                     )
                     st.markdown(f"**Rank #{rank}** &nbsp;|&nbsp; Clip {clip['clip_id']}"
                                 f" &nbsp;|&nbsp; {clip.get('num_frames', '?')} frames sampled")
+                    st.markdown(
+                        f"Playback window: **{format_timestamp(play_start)} → {format_timestamp(play_end)}**"
+                    )
 
                     # Mini score bar
                     st.progress(score_pct / 100, text=f"Relevance: {score_pct:.1f}%")

@@ -21,6 +21,31 @@ _processor: Optional[CLIPProcessor] = None
 _device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _extract_tensor_features(output, *, kind: str) -> torch.Tensor:
+    """
+    Normalize CLIP output objects to a torch.Tensor.
+
+    Some transformers versions return plain tensors from
+    `get_image_features/get_text_features`, while others may return model
+    outputs that contain the tensor under fields like `image_embeds`,
+    `text_embeds`, or `pooler_output`.
+    """
+    if torch.is_tensor(output):
+        return output
+
+    # Common CLIP output fields first
+    for attr in ("image_embeds", "text_embeds", "pooler_output"):
+        if hasattr(output, attr):
+            value = getattr(output, attr)
+            if torch.is_tensor(value):
+                return value
+
+    raise TypeError(
+        f"Unexpected {kind} feature output type: {type(output).__name__}. "
+        "Could not find tensor embeddings."
+    )
+
+
 def _load_model():
     global _model, _processor
     if _model is None:
@@ -85,7 +110,12 @@ def embed_images(frame_infos: List[Dict[str, Any]], batch_size: int = 32) -> np.
         inputs = processor(images=images, return_tensors="pt", padding=True).to(_device)
 
         with torch.no_grad():
-            feats = model.get_image_features(**inputs)
+            # Prefer full forward for compatibility across transformers versions.
+            # Fallback to get_image_features for older/newer behavior differences.
+            try:
+                feats = _extract_tensor_features(model(**inputs), kind="image")
+            except Exception:
+                feats = _extract_tensor_features(model.get_image_features(**inputs), kind="image")
 
         all_embeddings.append(feats.cpu().float().numpy())
         logger.debug(f"Embedded batch {i // batch_size + 1} ({len(images)} images)")
@@ -119,7 +149,10 @@ def embed_text(text: str) -> np.ndarray:
     inputs = processor(text=[text], return_tensors="pt", padding=True).to(_device)
 
     with torch.no_grad():
-        feats = model.get_text_features(**inputs)
+        try:
+            feats = _extract_tensor_features(model(**inputs), kind="text")
+        except Exception:
+            feats = _extract_tensor_features(model.get_text_features(**inputs), kind="text")
 
     # Shape: (1, 512) — keep 2D so FAISS search() receives the expected shape
     embedding = feats.cpu().float().numpy()

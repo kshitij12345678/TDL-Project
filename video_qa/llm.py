@@ -6,9 +6,16 @@ Tries Gemini first, then OpenAI, then falls back to a structured template answer
 
 import logging
 import os
+
+from dotenv import load_dotenv
+from PIL import Image
+
 from video_qa.temporal import format_timestamp
 
 logger = logging.getLogger(__name__)
+
+# Load .env automatically (if present) so API keys work with `streamlit run app.py`
+load_dotenv(override=False)
 
 
 def _build_prompt(query: str, clips: list[dict]) -> str:
@@ -40,17 +47,75 @@ Based on these timestamps and their relevance scores, provide a concise, helpful
 """
 
 
-def _try_gemini(prompt: str) -> str | None:
+def _build_gemini_parts(query: str, clips: list[dict]) -> list:
+    """Build multimodal Gemini input: text + representative frames for top clips."""
+    top = clips[:5]
+
+    lines = [
+        "You are an intelligent video analysis assistant.",
+        f'Question: "{query}"',
+        "You are given timestamps and representative frames from the top retrieved clips.",
+        "Use this evidence to answer in 3-5 sentences.",
+        "Mention timestamps in your final answer.",
+        "If uncertain, state uncertainty briefly.",
+        "",
+        "Retrieved clips:",
+    ]
+
+    for i, clip in enumerate(top, 1):
+        ts_start = format_timestamp(clip["start_sec"])
+        ts_end = format_timestamp(clip["end_sec"])
+        score = clip.get("score", 0.0)
+        lines.append(f"- Clip {i}: [{ts_start} → {ts_end}] (score: {score:.3f})")
+
+    parts: list = ["\n".join(lines)]
+
+    for i, clip in enumerate(top, 1):
+        frame_path = clip.get("representative_frame", "")
+        if not frame_path or not os.path.exists(frame_path):
+            continue
+        try:
+            img = Image.open(frame_path).convert("RGB")
+            ts_start = format_timestamp(clip["start_sec"])
+            ts_end = format_timestamp(clip["end_sec"])
+            parts.append(f"Representative frame for Clip {i} at {ts_start} → {ts_end}:")
+            parts.append(img)
+        except Exception as e:
+            logger.warning(f"Failed to load representative frame '{frame_path}': {e}")
+
+    return parts
+
+
+def _try_gemini(prompt: str, query: str, clips: list[dict]) -> str | None:
     """Attempt to call Gemini API."""
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
+        logger.info("GEMINI_API_KEY not found in environment; skipping Gemini.")
         return None
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        parts = _build_gemini_parts(query, clips)
+        response = model.generate_content(parts if parts else prompt)
+
+        text = getattr(response, "text", None)
+        if text and text.strip():
+            return text.strip()
+
+        # Fallback parsing for SDK variants
+        candidates = getattr(response, "candidates", None) or []
+        for cand in candidates:
+            content = getattr(cand, "content", None)
+            chunks = getattr(content, "parts", None) or []
+            joined = "\n".join(
+                p.text for p in chunks if getattr(p, "text", None)
+            ).strip()
+            if joined:
+                return joined
+
+        logger.warning("Gemini returned an empty response.")
+        return None
     except Exception as e:
         logger.warning(f"Gemini call failed: {e}")
         return None
@@ -121,7 +186,7 @@ def explain(query: str, clips: list[dict]) -> str:
     """
     prompt = _build_prompt(query, clips)
 
-    answer = _try_gemini(prompt)
+    answer = _try_gemini(prompt, query, clips)
     if answer:
         logger.info("Used Gemini for explanation.")
         return answer
